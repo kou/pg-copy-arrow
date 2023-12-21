@@ -15,18 +15,12 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
-CREATE FUNCTION copy_to_arrow(pg_catalog.regclass)
-     RETURNS bytea
-     AS 'MODULE_PATHNAME' LANGUAGE C;
+CREATE TABLE data (
+  value integer
+);
 
-CREATE FUNCTION scan_to_arrow(pg_catalog.regclass)
-     RETURNS bytea
-     AS 'MODULE_PATHNAME' LANGUAGE C;
+INSERT INTO data SELECT generate_series(1, 10);
 
-CREATE FUNCTION format_arrow(bytea)
-     RETURNS text
-     AS 'MODULE_PATHNAME' LANGUAGE C;
+COPY data TO '/tmp/data.arrows' WITH (FORMAT arrow);
 
-CREATE FUNCTION arrow(internal)
-     RETURNS copy_handler
-     AS 'MODULE_PATHNAME', 'copy_arrow_handler' LANGUAGE C;
+DROP TABLE data;

@@ -87,6 +87,7 @@ install_data(
 
 result_dirs = [
   'results' / 'copy_to_arrow',
+  'results' / 'copy_to_format',
   'results' / 'scan_to_arrow',
 ]
 ensure_results = custom_target('ensure-results',
@@ -103,6 +104,7 @@ test('regress',
        '--inputdir', meson.current_source_dir(),
        '--load-extension', 'copy_arrow',
        'copy_to_arrow' / 'int32',
+       'copy_to_format' / 'int32',
        'scan_to_arrow' / 'int32',
      ],
      depends: [ensure_results],

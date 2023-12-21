@@ -14,19 +14,9 @@
 -- KIND, either express or implied.  See the License for the
 -- specific language governing permissions and limitations
 -- under the License.
-
-CREATE FUNCTION copy_to_arrow(pg_catalog.regclass)
-     RETURNS bytea
-     AS 'MODULE_PATHNAME' LANGUAGE C;
-
-CREATE FUNCTION scan_to_arrow(pg_catalog.regclass)
-     RETURNS bytea
-     AS 'MODULE_PATHNAME' LANGUAGE C;
-
-CREATE FUNCTION format_arrow(bytea)
-     RETURNS text
-     AS 'MODULE_PATHNAME' LANGUAGE C;
-
-CREATE FUNCTION arrow(internal)
-     RETURNS copy_handler
-     AS 'MODULE_PATHNAME', 'copy_arrow_handler' LANGUAGE C;
+CREATE TABLE data (
+  value integer
+);
+INSERT INTO data SELECT generate_series(1, 10);
+COPY data TO '/tmp/data.arrows' WITH (FORMAT arrow);
+DROP TABLE data;

@@ -383,6 +383,157 @@ build_schema(TupleDesc tuple_desc)
 	return *schema_builder.Finish();
 }
 
+std::shared_ptr<arrow::Schema>
+build_schema(TupleDesc tuple_desc, List* attnumlist)
+{
+	arrow::SchemaBuilder schema_builder;
+	ListCell* cur;
+	foreach (cur, attnumlist)
+	{
+		auto attnum = lfirst_int(cur);
+		auto attribute = TupleDescAttr(tuple_desc, attnum - 1);
+		std::shared_ptr<arrow::Field> field;
+		switch (attribute->atttypid)
+		{
+			case INT4OID:
+				field = arrow::field(
+					NameStr(attribute->attname), arrow::int32(), !attribute->attnotnull);
+				break;
+			case TEXTOID:
+				field = arrow::field(
+					NameStr(attribute->attname), arrow::utf8(), !attribute->attnotnull);
+				break;
+			default:
+				ereport(ERROR,
+				        errcode(ERRCODE_INTERNAL_ERROR),
+				        errmsg("unsupported type: %u", attribute->atttypid));
+				break;
+		}
+		ARROW_IGNORE_EXPR(schema_builder.AddField(std::move(field)));
+	}
+	return *schema_builder.Finish();
+}
+
+class CopyToStateOutputStream : public arrow::io::OutputStream {
+   public:
+	CopyToStateOutputStream(CopyToState cstate) : cstate_(cstate), position_(0) {}
+
+	arrow::Status Close() override { return arrow::Status::OK(); }
+
+	bool closed() const override { return false; }
+
+	arrow::Result<int64_t> Tell() const override { return position_; }
+
+	arrow::Status Write(const void* data, int64_t n_bytes) override
+	{
+		if (ARROW_PREDICT_TRUE(n_bytes > 0))
+		{
+			CopyToStateSendData(cstate_, data, n_bytes);
+			position_ += n_bytes;
+		}
+		return arrow::Status::OK();
+	}
+
+	using arrow::io::OutputStream::Write;
+
+	arrow::Status Flush() override
+	{
+		CopyToStateFlush(cstate_);
+		return arrow::Status::OK();
+	}
+
+   private:
+	CopyToState cstate_;
+	int64_t position_;
+};
+
+struct CopyToArrowData {
+	std::shared_ptr<arrow::Schema> schema;
+	std::shared_ptr<arrow::RecordBatchBuilder> builder;
+	std::shared_ptr<arrow::io::OutputStream> output;
+	std::shared_ptr<arrow::ipc::RecordBatchWriter> writer;
+	int64_t n_building_records;
+};
+
+void
+copy_to_arrow_start(CopyToState cstate, TupleDesc desc)
+{
+	auto data = new CopyToArrowData();
+	auto attnumlist = CopyToStateGetAttNumList(cstate);
+	data->schema = build_schema(desc, attnumlist);
+	data->builder =
+		*arrow::RecordBatchBuilder::Make(data->schema, arrow::default_memory_pool());
+	data->output = std::make_shared<CopyToStateOutputStream>(cstate);
+	data->writer = *arrow::ipc::MakeStreamWriter(data->output, data->schema);
+	data->n_building_records = 0;
+	CopyToStateSetOpaque(cstate, data);
+}
+
+void
+copy_to_arrow_one_row(CopyToState cstate, TupleTableSlot* slot)
+{
+	auto data = static_cast<CopyToArrowData*>(CopyToStateGetOpaque(cstate));
+
+	int i = 0;
+	auto attnumlist = CopyToStateGetAttNumList(cstate);
+	ListCell* cur;
+	foreach (cur, attnumlist)
+	{
+		auto attnum = lfirst_int(cur);
+		auto value = slot->tts_values[attnum - 1];
+		auto isnull = slot->tts_isnull[attnum - 1];
+
+		if (isnull)
+		{
+			ARROW_IGNORE_EXPR(data->builder->GetField(i)->AppendNull());
+		}
+		else
+		{
+			auto attribute = TupleDescAttr(slot->tts_tupleDescriptor, attnum - 1);
+			switch (attribute->atttypid)
+			{
+				case INT4OID:
+					ARROW_IGNORE_EXPR(
+						data->builder->GetFieldAs<arrow::Int32Builder>(i)->Append(
+							DatumGetInt32(value)));
+					break;
+				case TEXTOID:
+					ARROW_IGNORE_EXPR(
+						data->builder->GetFieldAs<arrow::StringBuilder>(i)->Append(
+							VARDATA_ANY(value), VARSIZE_ANY_EXHDR(value)));
+					break;
+				default:
+					ereport(ERROR,
+					        errcode(ERRCODE_INTERNAL_ERROR),
+					        errmsg("unsupported type: %u", attribute->atttypid));
+					break;
+			}
+		}
+	}
+	data->n_building_records++;
+	if (data->n_building_records == 1000)
+	{
+		auto record_batch = *data->builder->Flush();
+		ARROW_IGNORE_EXPR(data->writer->WriteRecordBatch(*record_batch));
+		data->n_building_records = 0;
+	}
+}
+
+void
+copy_to_arrow_end(CopyToState cstate)
+{
+	auto data = static_cast<CopyToArrowData*>(CopyToStateGetOpaque(cstate));
+	if (data->n_building_records > 0)
+	{
+		auto record_batch = *data->builder->Flush();
+		ARROW_IGNORE_EXPR(data->writer->WriteRecordBatch(*record_batch));
+	}
+	ARROW_IGNORE_EXPR(data->writer->Close());
+	ARROW_IGNORE_EXPR(data->output->Flush());
+	delete data;
+	CopyToStateSetOpaque(cstate, nullptr);
+}
+
 };  // namespace
 
 extern "C"
@@ -513,5 +664,29 @@ extern "C"
 		auto table_string = table->ToString();
 		PG_RETURN_TEXT_P(
 			cstring_to_text_with_len(table_string.data(), table_string.length()));
+	}
+
+	PGDLLEXPORT PG_FUNCTION_INFO_V1(copy_arrow_handler);
+	Datum copy_arrow_handler(PG_FUNCTION_ARGS)
+	{
+		auto is_from = PG_GETARG_BOOL(0);
+		auto routine = makeNode(CopyFormatRoutine);
+
+		routine->is_from = is_from;
+		if (!is_from)
+		{
+			auto to_routine = makeNode(CopyToFormatRoutine);
+
+			to_routine->start_fn = copy_to_arrow_start;
+			to_routine->onerow_fn = copy_to_arrow_one_row;
+			to_routine->end_fn = copy_to_arrow_end;
+
+			routine->routine = reinterpret_cast<Node*>(to_routine);
+		}
+		else
+		{
+		}
+
+		PG_RETURN_POINTER(routine);
 	}
 }
