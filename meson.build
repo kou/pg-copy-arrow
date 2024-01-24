@@ -86,6 +86,7 @@ install_data(
 )
 
 result_dirs = [
+  'results' / 'copy_format',
   'results' / 'copy_to_arrow',
   'results' / 'copy_to_format',
   'results' / 'scan_to_arrow',
@@ -103,6 +104,7 @@ test('regress',
        '--bindir', bin_dir,
        '--inputdir', meson.current_source_dir(),
        '--load-extension', 'copy_arrow',
+       'copy_format' / 'int32',
        'copy_to_arrow' / 'int32',
        'copy_to_format' / 'int32',
        'scan_to_arrow' / 'int32',

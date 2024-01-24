@@ -354,6 +354,182 @@ copy_arrow_to_callback(void* data, int len)
 	copy_arrow_binary_format_parser->emit(data, len);
 }
 
+class CopyFromStateInputStream : public arrow::io::InputStream {
+   public:
+	CopyFromStateInputStream(CopyFromState cstate)
+		: arrow::io::InputStream(), cstate_(cstate), position_(0), closed_(false)
+	{
+	}
+
+	arrow::Status Close() override
+	{
+		closed_ = true;
+		return arrow::Status::OK();
+	}
+
+	bool closed() const override { return closed_; }
+
+	arrow::Result<int64_t> Tell() const override { return position_; }
+
+	arrow::Result<int64_t> Read(int64_t nbytes, void* out) override
+	{
+		auto read_nbytes = CopyFromStateRead(cstate_, static_cast<char*>(out), nbytes);
+		position_ += read_nbytes;
+		if (read_nbytes < nbytes)
+		{
+			closed_ = true;
+		}
+		return read_nbytes;
+	}
+
+	arrow::Result<std::shared_ptr<arrow::Buffer>> Read(int64_t nbytes) override
+	{
+		ARROW_ASSIGN_OR_RAISE(auto buffer, arrow::AllocateResizableBuffer(nbytes));
+		auto read_nbytes =
+			CopyFromStateRead(cstate_, buffer->mutable_data_as<char>(), nbytes);
+		position_ += read_nbytes;
+		if (read_nbytes < nbytes)
+		{
+			closed_ = true;
+			ARROW_RETURN_NOT_OK(buffer->Resize(read_nbytes));
+		}
+		return buffer;
+	}
+
+   private:
+	CopyFromState cstate_;
+	int64_t position_;
+	bool closed_;
+};
+
+struct CopyFromArrowData {
+	std::shared_ptr<arrow::io::InputStream> input;
+	std::shared_ptr<arrow::ipc::RecordBatchStreamReader> reader;
+	std::shared_ptr<arrow::RecordBatch> current_record_batch;
+	int64_t i_record;
+};
+
+bool
+copy_from_arrow_process_option(CopyFromState cstate, DefElem* defel)
+{
+	return false;
+}
+
+int16
+copy_from_arrow_get_format(CopyFromState cstate)
+{
+	return 1;
+}
+
+void
+copy_from_arrow_start(CopyFromState cstate, TupleDesc desc)
+{
+	auto data = new CopyFromArrowData();
+	data->input = std::make_shared<CopyFromStateInputStream>(cstate);
+	data->reader = *arrow::ipc::RecordBatchStreamReader::Open(data->input);
+	data->current_record_batch = nullptr;
+	data->i_record = 0;
+	cstate->opaque = data;
+	cstate->opts.binary = true;
+}
+
+bool
+copy_from_arrow_one_row(CopyFromState cstate,
+                        ExprContext* econtext,
+                        Datum* values,
+                        bool* nulls)
+{
+	auto data = static_cast<CopyFromArrowData*>(cstate->opaque);
+
+	if (!data->current_record_batch)
+	{
+		while (true)
+		{
+			auto record_batch_result = data->reader->Next();
+			if (!record_batch_result.ok())
+			{
+				return false;
+			}
+			data->current_record_batch = *record_batch_result;
+			if (!data->current_record_batch)
+			{
+				return false;
+			}
+			if (data->current_record_batch->num_rows() > 0)
+			{
+				break;
+			}
+			data->current_record_batch = nullptr;
+		}
+	}
+
+	auto tuple_description = RelationGetDescr(cstate->rel);
+	auto attnumlist = cstate->attnumlist;
+	ListCell* cur;
+	foreach (cur, attnumlist)
+	{
+		auto i = lfirst_int(cur) - 1;
+		auto attribute = TupleDescAttr(tuple_description, i);
+		auto attribute_name = NameStr(attribute->attname);
+		auto column = data->current_record_batch->GetColumnByName(attribute_name);
+
+		cstate->cur_attname = attribute_name;
+
+		nulls[i] = column->IsNull(data->i_record);
+		if (nulls[i])
+			continue;
+
+		switch (attribute->atttypid)
+		{
+			case INT4OID:
+				values[i] = Int32GetDatum(
+					std::static_pointer_cast<arrow::Int32Array>(column)->Value(
+						data->i_record));
+				break;
+			case TEXTOID:
+			{
+				auto value = std::static_pointer_cast<arrow::StringArray>(column)->Value(
+					data->i_record);
+				values[i] = PointerGetDatum(
+					cstring_to_text_with_len(value.data(), value.length()));
+				break;
+			}
+			default:
+				ereport(ERROR,
+				        errcode(ERRCODE_INTERNAL_ERROR),
+				        errmsg("unsupported type: %u", attribute->atttypid));
+				break;
+		}
+	}
+	data->i_record++;
+	if (data->i_record == data->current_record_batch->num_rows())
+	{
+		data->current_record_batch = nullptr;
+		data->i_record = 0;
+	}
+	return true;
+}
+
+void
+copy_from_arrow_end(CopyFromState cstate)
+{
+	auto data = static_cast<CopyFromArrowData*>(cstate->opaque);
+	data->current_record_batch = nullptr;
+	ARROW_IGNORE_EXPR(data->reader->Close());
+	ARROW_IGNORE_EXPR(data->input->Close());
+	delete data;
+	cstate->opaque = nullptr;
+}
+
+const CopyFromRoutine copy_from_routine_arrow = {
+	T_CopyFromRoutine,
+	copy_from_arrow_process_option,
+	copy_from_arrow_get_format,
+	copy_from_arrow_start,
+	copy_from_arrow_one_row,
+	copy_from_arrow_end,
+};
+
 std::shared_ptr<arrow::Schema>
 build_schema(TupleDesc tuple_desc)
 {
@@ -416,7 +592,10 @@ build_schema(TupleDesc tuple_desc, List* attnumlist)
 
 class CopyToStateOutputStream : public arrow::io::OutputStream {
    public:
-	CopyToStateOutputStream(CopyToState cstate) : cstate_(cstate), position_(0) {}
+	CopyToStateOutputStream(CopyToState cstate)
+		: arrow::io::OutputStream(), cstate_(cstate), position_(0)
+	{
+	}
 
 	arrow::Status Close() override { return arrow::Status::OK(); }
 
@@ -428,7 +607,7 @@ class CopyToStateOutputStream : public arrow::io::OutputStream {
 	{
 		if (ARROW_PREDICT_TRUE(n_bytes > 0))
 		{
-			CopyToStateSendData(cstate_, data, n_bytes);
+			appendBinaryStringInfo(cstate_->fe_msgbuf, data, n_bytes);
 			position_ += n_bytes;
 		}
 		return arrow::Status::OK();
@@ -455,27 +634,40 @@ struct CopyToArrowData {
 	int64_t n_building_records;
 };
 
+bool
+copy_to_arrow_process_option(CopyToState cstate, DefElem* defel)
+{
+	return false;
+}
+
+int16
+copy_to_arrow_get_format(CopyToState cstate)
+{
+	return 1;
+}
+
 void
 copy_to_arrow_start(CopyToState cstate, TupleDesc desc)
 {
 	auto data = new CopyToArrowData();
-	auto attnumlist = CopyToStateGetAttNumList(cstate);
+	auto attnumlist = cstate->attnumlist;
 	data->schema = build_schema(desc, attnumlist);
 	data->builder =
 		*arrow::RecordBatchBuilder::Make(data->schema, arrow::default_memory_pool());
 	data->output = std::make_shared<CopyToStateOutputStream>(cstate);
 	data->writer = *arrow::ipc::MakeStreamWriter(data->output, data->schema);
 	data->n_building_records = 0;
-	CopyToStateSetOpaque(cstate, data);
+	cstate->opaque = data;
+	cstate->opts.binary = true;
 }
 
 void
 copy_to_arrow_one_row(CopyToState cstate, TupleTableSlot* slot)
 {
-	auto data = static_cast<CopyToArrowData*>(CopyToStateGetOpaque(cstate));
+	auto data = static_cast<CopyToArrowData*>(cstate->opaque);
 
 	int i = 0;
-	auto attnumlist = CopyToStateGetAttNumList(cstate);
+	auto attnumlist = cstate->attnumlist;
 	ListCell* cur;
 	foreach (cur, attnumlist)
 	{
@@ -522,7 +714,7 @@ copy_to_arrow_one_row(CopyToState cstate, TupleTableSlot* slot)
 void
 copy_to_arrow_end(CopyToState cstate)
 {
-	auto data = static_cast<CopyToArrowData*>(CopyToStateGetOpaque(cstate));
+	auto data = static_cast<CopyToArrowData*>(cstate->opaque);
 	if (data->n_building_records > 0)
 	{
 		auto record_batch = *data->builder->Flush();
@@ -531,8 +723,17 @@ copy_to_arrow_end(CopyToState cstate)
 	ARROW_IGNORE_EXPR(data->writer->Close());
 	ARROW_IGNORE_EXPR(data->output->Flush());
 	delete data;
-	CopyToStateSetOpaque(cstate, nullptr);
+	cstate->opaque = nullptr;
 }
+
+const CopyToRoutine copy_to_routine_arrow = {
+	T_CopyToRoutine,
+	copy_to_arrow_process_option,
+	copy_to_arrow_get_format,
+	copy_to_arrow_start,
+	copy_to_arrow_one_row,
+	copy_to_arrow_end,
+};
 
 };  // namespace
 
@@ -670,23 +871,14 @@ extern "C"
 	Datum copy_arrow_handler(PG_FUNCTION_ARGS)
 	{
 		auto is_from = PG_GETARG_BOOL(0);
-		auto routine = makeNode(CopyFormatRoutine);
 
-		routine->is_from = is_from;
-		if (!is_from)
+		if (is_from)
 		{
-			auto to_routine = makeNode(CopyToFormatRoutine);
-
-			to_routine->start_fn = copy_to_arrow_start;
-			to_routine->onerow_fn = copy_to_arrow_one_row;
-			to_routine->end_fn = copy_to_arrow_end;
-
-			routine->routine = reinterpret_cast<Node*>(to_routine);
+			PG_RETURN_POINTER(&copy_from_routine_arrow);
 		}
 		else
 		{
+			PG_RETURN_POINTER(&copy_to_routine_arrow);
 		}
-
-		PG_RETURN_POINTER(routine);
 	}
 }
