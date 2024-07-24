@@ -409,16 +409,12 @@ struct CopyFromArrowData {
 	int64_t i_record;
 };
 
-bool
-copy_from_arrow_process_option(CopyFromState cstate, DefElem* defel)
+void
+copy_from_arrow_in_func(CopyFromState cstate,
+                        Oid atttypid,
+                        FmgrInfo* finfo,
+                        Oid* typioparam)
 {
-	return false;
-}
-
-int16
-copy_from_arrow_get_format(CopyFromState cstate)
-{
-	return 1;
 }
 
 void
@@ -523,8 +519,7 @@ copy_from_arrow_end(CopyFromState cstate)
 
 const CopyFromRoutine copy_from_routine_arrow = {
 	T_CopyFromRoutine,
-	copy_from_arrow_process_option,
-	copy_from_arrow_get_format,
+	copy_from_arrow_in_func,
 	copy_from_arrow_start,
 	copy_from_arrow_one_row,
 	copy_from_arrow_end,
@@ -634,16 +629,9 @@ struct CopyToArrowData {
 	int64_t n_building_records;
 };
 
-bool
-copy_to_arrow_process_option(CopyToState cstate, DefElem* defel)
+void
+copy_to_arrow_out_func(CopyToState cstate, Oid atttypid, FmgrInfo* finfo)
 {
-	return false;
-}
-
-int16
-copy_to_arrow_get_format(CopyToState cstate)
-{
-	return 1;
 }
 
 void
@@ -728,8 +716,7 @@ copy_to_arrow_end(CopyToState cstate)
 
 const CopyToRoutine copy_to_routine_arrow = {
 	T_CopyToRoutine,
-	copy_to_arrow_process_option,
-	copy_to_arrow_get_format,
+	copy_to_arrow_out_func,
 	copy_to_arrow_start,
 	copy_to_arrow_one_row,
 	copy_to_arrow_end,
