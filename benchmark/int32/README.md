@@ -41,18 +41,18 @@ Here is a benchmark result on the following environment:
 
 100K records:
 
-| COPY | SCAN |
-| ---- | ---- |
+| COPY   | SCAN   |
+| ------ | ------ |
 | 99.558 | 66.340 |
 
 1M records:
 
-| COPY | SCAN |
-| ---- | ---- |
+| COPY    | SCAN    |
+| ------- | ------- |
 | 541.505 | 216.474 |
 
 10M records:
 
-| COPY | SCAN |
-| ---- | ---- |
+| COPY     | SCAN     |
+| -------- | -------- |
 | 4839.805 | 1827.057 |
