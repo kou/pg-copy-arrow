@@ -23,6 +23,10 @@ This is a PoC to implement `COPY` with Apache Arrow streaming format
 instead of built-in binary format nor text format. It's for
 performance.
 
+This is for
+https://github.com/kou/postgres/tree/copy-format-extendable-2024-11-v26
+.
+
 ## License
 
 The Apache License 2.0. See [LICENSE.txt](LICENSE.txt) for details.

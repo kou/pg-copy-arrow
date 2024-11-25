@@ -21,7 +21,7 @@ extern "C"
 
 #include <access/table.h>
 #include <access/tableam.h>
-#include <commands/copy.h>
+#include <commands/copyapi.h>
 #include <executor/tuptable.h>
 #include <nodes/makefuncs.h>
 #include <nodes/value.h>
