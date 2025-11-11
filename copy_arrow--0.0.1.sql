@@ -26,7 +26,3 @@ CREATE FUNCTION scan_to_arrow(pg_catalog.regclass)
 CREATE FUNCTION format_arrow(bytea)
      RETURNS text
      AS 'MODULE_PATHNAME' LANGUAGE C;
-
-CREATE FUNCTION arrow(internal)
-     RETURNS copy_handler
-     AS 'MODULE_PATHNAME', 'copy_arrow_handler' LANGUAGE C;

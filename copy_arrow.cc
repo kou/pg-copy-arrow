@@ -22,6 +22,7 @@ extern "C"
 #include <access/table.h>
 #include <access/tableam.h>
 #include <commands/copyapi.h>
+#include <commands/copystate.h>
 #include <executor/tuptable.h>
 #include <nodes/makefuncs.h>
 #include <nodes/value.h>
@@ -373,7 +374,8 @@ class CopyFromStateInputStream : public arrow::io::InputStream {
 
 	arrow::Result<int64_t> Read(int64_t nbytes, void* out) override
 	{
-		auto read_nbytes = CopyFromStateRead(cstate_, static_cast<char*>(out), nbytes);
+		auto read_nbytes =
+			CopyFromGetData(cstate_, static_cast<char*>(out), nbytes, nbytes);
 		position_ += read_nbytes;
 		if (read_nbytes < nbytes)
 		{
@@ -386,7 +388,7 @@ class CopyFromStateInputStream : public arrow::io::InputStream {
 	{
 		ARROW_ASSIGN_OR_RAISE(auto buffer, arrow::AllocateResizableBuffer(nbytes));
 		auto read_nbytes =
-			CopyFromStateRead(cstate_, buffer->mutable_data_as<char>(), nbytes);
+			CopyFromGetData(cstate_, buffer->mutable_data_as<char>(), nbytes, nbytes);
 		position_ += read_nbytes;
 		if (read_nbytes < nbytes)
 		{
@@ -408,6 +410,12 @@ struct CopyFromArrowData {
 	std::shared_ptr<arrow::RecordBatch> current_record_batch;
 	int64_t i_record;
 };
+
+Size
+copy_from_arrow_estimate_state_space(void)
+{
+	return sizeof(CopyFromStateData);
+}
 
 void
 copy_from_arrow_in_func(CopyFromState cstate,
@@ -433,7 +441,8 @@ bool
 copy_from_arrow_one_row(CopyFromState cstate,
                         ExprContext* econtext,
                         Datum* values,
-                        bool* nulls)
+                        bool* nulls,
+                        CopyFromRowInfo* rowinfo)
 {
 	auto data = static_cast<CopyFromArrowData*>(cstate->opaque);
 
@@ -518,7 +527,8 @@ copy_from_arrow_end(CopyFromState cstate)
 }
 
 const CopyFromRoutine copy_from_routine_arrow = {
-	T_CopyFromRoutine,
+	copy_from_arrow_estimate_state_space,
+	nullptr,
 	copy_from_arrow_in_func,
 	copy_from_arrow_start,
 	copy_from_arrow_one_row,
@@ -612,7 +622,7 @@ class CopyToStateOutputStream : public arrow::io::OutputStream {
 
 	arrow::Status Flush() override
 	{
-		CopyToStateFlush(cstate_);
+		CopyToFlushData(cstate_);
 		return arrow::Status::OK();
 	}
 
@@ -628,6 +638,12 @@ struct CopyToArrowData {
 	std::shared_ptr<arrow::ipc::RecordBatchWriter> writer;
 	int64_t n_building_records;
 };
+
+Size
+copy_to_arrow_estimate_state_space(void)
+{
+	return sizeof(CopyToStateData);
+}
 
 void
 copy_to_arrow_out_func(CopyToState cstate, Oid atttypid, FmgrInfo* finfo)
@@ -680,7 +696,8 @@ copy_to_arrow_one_row(CopyToState cstate, TupleTableSlot* slot)
 				case TEXTOID:
 					ARROW_IGNORE_EXPR(
 						data->builder->GetFieldAs<arrow::StringBuilder>(i)->Append(
-							VARDATA_ANY(value), VARSIZE_ANY_EXHDR(value)));
+							VARDATA_ANY(DatumGetTextP(value)),
+							VARSIZE_ANY_EXHDR(DatumGetTextP(value))));
 					break;
 				default:
 					ereport(ERROR,
@@ -715,7 +732,8 @@ copy_to_arrow_end(CopyToState cstate)
 }
 
 const CopyToRoutine copy_to_routine_arrow = {
-	T_CopyToRoutine,
+	copy_to_arrow_estimate_state_space,
+	nullptr,
 	copy_to_arrow_out_func,
 	copy_to_arrow_start,
 	copy_to_arrow_one_row,
@@ -731,6 +749,9 @@ extern "C"
 	extern PGDLLEXPORT void _PG_init(void)
 	{
 		before_shmem_exit(copy_arrow_before_shmem_exit, 0);
+
+		RegisterCopyCustomFormat(
+			"arrow", &copy_from_routine_arrow, &copy_to_routine_arrow);
 	}
 
 	PGDLLEXPORT PG_FUNCTION_INFO_V1(copy_to_arrow);
@@ -812,7 +833,8 @@ extern "C"
 					case TEXTOID:
 						ARROW_IGNORE_EXPR(
 							builder->GetFieldAs<arrow::StringBuilder>(i)->Append(
-								VARDATA_ANY(datum), VARSIZE_ANY_EXHDR(datum)));
+								VARDATA_ANY(DatumGetTextP(datum)),
+								VARSIZE_ANY_EXHDR(DatumGetTextP(datum))));
 						break;
 					default:
 						ereport(ERROR,
@@ -852,20 +874,5 @@ extern "C"
 		auto table_string = table->ToString();
 		PG_RETURN_TEXT_P(
 			cstring_to_text_with_len(table_string.data(), table_string.length()));
-	}
-
-	PGDLLEXPORT PG_FUNCTION_INFO_V1(copy_arrow_handler);
-	Datum copy_arrow_handler(PG_FUNCTION_ARGS)
-	{
-		auto is_from = PG_GETARG_BOOL(0);
-
-		if (is_from)
-		{
-			PG_RETURN_POINTER(&copy_from_routine_arrow);
-		}
-		else
-		{
-			PG_RETURN_POINTER(&copy_to_routine_arrow);
-		}
 	}
 }
