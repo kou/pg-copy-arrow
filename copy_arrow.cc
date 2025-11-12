@@ -404,7 +404,9 @@ class CopyFromStateInputStream : public arrow::io::InputStream {
 	bool closed_;
 };
 
-struct CopyFromArrowData {
+struct CopyFromArrowStateData {
+	CopyFromStateData parent;
+
 	std::shared_ptr<arrow::io::InputStream> input;
 	std::shared_ptr<arrow::ipc::RecordBatchStreamReader> reader;
 	std::shared_ptr<arrow::RecordBatch> current_record_batch;
@@ -414,7 +416,7 @@ struct CopyFromArrowData {
 Size
 copy_from_arrow_estimate_state_space(void)
 {
-	return sizeof(CopyFromStateData);
+	return sizeof(CopyFromArrowStateData);
 }
 
 void
@@ -428,12 +430,12 @@ copy_from_arrow_in_func(CopyFromState cstate,
 void
 copy_from_arrow_start(CopyFromState cstate, TupleDesc desc)
 {
-	auto data = new CopyFromArrowData();
-	data->input = std::make_shared<CopyFromStateInputStream>(cstate);
-	data->reader = *arrow::ipc::RecordBatchStreamReader::Open(data->input);
-	data->current_record_batch = nullptr;
-	data->i_record = 0;
-	cstate->opaque = data;
+	auto arrow_cstate = reinterpret_cast<CopyFromArrowStateData*>(cstate);
+	arrow_cstate->input = std::make_shared<CopyFromStateInputStream>(cstate);
+	arrow_cstate->reader =
+		*arrow::ipc::RecordBatchStreamReader::Open(arrow_cstate->input);
+	arrow_cstate->current_record_batch = nullptr;
+	arrow_cstate->i_record = 0;
 	cstate->opts.binary = true;
 }
 
@@ -444,27 +446,27 @@ copy_from_arrow_one_row(CopyFromState cstate,
                         bool* nulls,
                         CopyFromRowInfo* rowinfo)
 {
-	auto data = static_cast<CopyFromArrowData*>(cstate->opaque);
+	auto arrow_cstate = reinterpret_cast<CopyFromArrowStateData*>(cstate);
 
-	if (!data->current_record_batch)
+	if (!arrow_cstate->current_record_batch)
 	{
 		while (true)
 		{
-			auto record_batch_result = data->reader->Next();
+			auto record_batch_result = arrow_cstate->reader->Next();
 			if (!record_batch_result.ok())
 			{
 				return false;
 			}
-			data->current_record_batch = *record_batch_result;
-			if (!data->current_record_batch)
+			arrow_cstate->current_record_batch = *record_batch_result;
+			if (!arrow_cstate->current_record_batch)
 			{
 				return false;
 			}
-			if (data->current_record_batch->num_rows() > 0)
+			if (arrow_cstate->current_record_batch->num_rows() > 0)
 			{
 				break;
 			}
-			data->current_record_batch = nullptr;
+			arrow_cstate->current_record_batch = nullptr;
 		}
 	}
 
@@ -476,11 +478,11 @@ copy_from_arrow_one_row(CopyFromState cstate,
 		auto i = lfirst_int(cur) - 1;
 		auto attribute = TupleDescAttr(tuple_description, i);
 		auto attribute_name = NameStr(attribute->attname);
-		auto column = data->current_record_batch->GetColumnByName(attribute_name);
+		auto column = arrow_cstate->current_record_batch->GetColumnByName(attribute_name);
 
 		cstate->cur_attname = attribute_name;
 
-		nulls[i] = column->IsNull(data->i_record);
+		nulls[i] = column->IsNull(arrow_cstate->i_record);
 		if (nulls[i])
 			continue;
 
@@ -489,12 +491,12 @@ copy_from_arrow_one_row(CopyFromState cstate,
 			case INT4OID:
 				values[i] = Int32GetDatum(
 					std::static_pointer_cast<arrow::Int32Array>(column)->Value(
-						data->i_record));
+						arrow_cstate->i_record));
 				break;
 			case TEXTOID:
 			{
 				auto value = std::static_pointer_cast<arrow::StringArray>(column)->Value(
-					data->i_record);
+					arrow_cstate->i_record);
 				values[i] = PointerGetDatum(
 					cstring_to_text_with_len(value.data(), value.length()));
 				break;
@@ -506,11 +508,11 @@ copy_from_arrow_one_row(CopyFromState cstate,
 				break;
 		}
 	}
-	data->i_record++;
-	if (data->i_record == data->current_record_batch->num_rows())
+	arrow_cstate->i_record++;
+	if (arrow_cstate->i_record == arrow_cstate->current_record_batch->num_rows())
 	{
-		data->current_record_batch = nullptr;
-		data->i_record = 0;
+		arrow_cstate->current_record_batch = nullptr;
+		arrow_cstate->i_record = 0;
 	}
 	return true;
 }
@@ -518,12 +520,10 @@ copy_from_arrow_one_row(CopyFromState cstate,
 void
 copy_from_arrow_end(CopyFromState cstate)
 {
-	auto data = static_cast<CopyFromArrowData*>(cstate->opaque);
-	data->current_record_batch = nullptr;
-	ARROW_IGNORE_EXPR(data->reader->Close());
-	ARROW_IGNORE_EXPR(data->input->Close());
-	delete data;
-	cstate->opaque = nullptr;
+	auto arrow_cstate = reinterpret_cast<CopyFromArrowStateData*>(cstate);
+	arrow_cstate->current_record_batch = nullptr;
+	ARROW_IGNORE_EXPR(arrow_cstate->reader->Close());
+	ARROW_IGNORE_EXPR(arrow_cstate->input->Close());
 }
 
 const CopyFromRoutine copy_from_routine_arrow = {
@@ -631,7 +631,9 @@ class CopyToStateOutputStream : public arrow::io::OutputStream {
 	int64_t position_;
 };
 
-struct CopyToArrowData {
+struct CopyToArrowStateData {
+	CopyToStateData parent;
+
 	std::shared_ptr<arrow::Schema> schema;
 	std::shared_ptr<arrow::RecordBatchBuilder> builder;
 	std::shared_ptr<arrow::io::OutputStream> output;
@@ -642,7 +644,7 @@ struct CopyToArrowData {
 Size
 copy_to_arrow_estimate_state_space(void)
 {
-	return sizeof(CopyToStateData);
+	return sizeof(CopyToArrowStateData);
 }
 
 void
@@ -653,22 +655,22 @@ copy_to_arrow_out_func(CopyToState cstate, Oid atttypid, FmgrInfo* finfo)
 void
 copy_to_arrow_start(CopyToState cstate, TupleDesc desc)
 {
-	auto data = new CopyToArrowData();
+	auto arrow_cstate = reinterpret_cast<CopyToArrowStateData*>(cstate);
 	auto attnumlist = cstate->attnumlist;
-	data->schema = build_schema(desc, attnumlist);
-	data->builder =
-		*arrow::RecordBatchBuilder::Make(data->schema, arrow::default_memory_pool());
-	data->output = std::make_shared<CopyToStateOutputStream>(cstate);
-	data->writer = *arrow::ipc::MakeStreamWriter(data->output, data->schema);
-	data->n_building_records = 0;
-	cstate->opaque = data;
+	arrow_cstate->schema = build_schema(desc, attnumlist);
+	arrow_cstate->builder = *arrow::RecordBatchBuilder::Make(
+		arrow_cstate->schema, arrow::default_memory_pool());
+	arrow_cstate->output = std::make_shared<CopyToStateOutputStream>(cstate);
+	arrow_cstate->writer =
+		*arrow::ipc::MakeStreamWriter(arrow_cstate->output, arrow_cstate->schema);
+	arrow_cstate->n_building_records = 0;
 	cstate->opts.binary = true;
 }
 
 void
 copy_to_arrow_one_row(CopyToState cstate, TupleTableSlot* slot)
 {
-	auto data = static_cast<CopyToArrowData*>(cstate->opaque);
+	auto arrow_cstate = reinterpret_cast<CopyToArrowStateData*>(cstate);
 
 	int i = 0;
 	auto attnumlist = cstate->attnumlist;
@@ -681,7 +683,7 @@ copy_to_arrow_one_row(CopyToState cstate, TupleTableSlot* slot)
 
 		if (isnull)
 		{
-			ARROW_IGNORE_EXPR(data->builder->GetField(i)->AppendNull());
+			ARROW_IGNORE_EXPR(arrow_cstate->builder->GetField(i)->AppendNull());
 		}
 		else
 		{
@@ -690,14 +692,14 @@ copy_to_arrow_one_row(CopyToState cstate, TupleTableSlot* slot)
 			{
 				case INT4OID:
 					ARROW_IGNORE_EXPR(
-						data->builder->GetFieldAs<arrow::Int32Builder>(i)->Append(
+						arrow_cstate->builder->GetFieldAs<arrow::Int32Builder>(i)->Append(
 							DatumGetInt32(value)));
 					break;
 				case TEXTOID:
 					ARROW_IGNORE_EXPR(
-						data->builder->GetFieldAs<arrow::StringBuilder>(i)->Append(
-							VARDATA_ANY(DatumGetTextP(value)),
-							VARSIZE_ANY_EXHDR(DatumGetTextP(value))));
+						arrow_cstate->builder->GetFieldAs<arrow::StringBuilder>(i)
+							->Append(VARDATA_ANY(DatumGetTextP(value)),
+					                 VARSIZE_ANY_EXHDR(DatumGetTextP(value))));
 					break;
 				default:
 					ereport(ERROR,
@@ -707,28 +709,26 @@ copy_to_arrow_one_row(CopyToState cstate, TupleTableSlot* slot)
 			}
 		}
 	}
-	data->n_building_records++;
-	if (data->n_building_records == 1000)
+	arrow_cstate->n_building_records++;
+	if (arrow_cstate->n_building_records == 1000)
 	{
-		auto record_batch = *data->builder->Flush();
-		ARROW_IGNORE_EXPR(data->writer->WriteRecordBatch(*record_batch));
-		data->n_building_records = 0;
+		auto record_batch = *arrow_cstate->builder->Flush();
+		ARROW_IGNORE_EXPR(arrow_cstate->writer->WriteRecordBatch(*record_batch));
+		arrow_cstate->n_building_records = 0;
 	}
 }
 
 void
 copy_to_arrow_end(CopyToState cstate)
 {
-	auto data = static_cast<CopyToArrowData*>(cstate->opaque);
-	if (data->n_building_records > 0)
+	auto arrow_cstate = reinterpret_cast<CopyToArrowStateData*>(cstate);
+	if (arrow_cstate->n_building_records > 0)
 	{
-		auto record_batch = *data->builder->Flush();
-		ARROW_IGNORE_EXPR(data->writer->WriteRecordBatch(*record_batch));
+		auto record_batch = *arrow_cstate->builder->Flush();
+		ARROW_IGNORE_EXPR(arrow_cstate->writer->WriteRecordBatch(*record_batch));
 	}
-	ARROW_IGNORE_EXPR(data->writer->Close());
-	ARROW_IGNORE_EXPR(data->output->Flush());
-	delete data;
-	cstate->opaque = nullptr;
+	ARROW_IGNORE_EXPR(arrow_cstate->writer->Close());
+	ARROW_IGNORE_EXPR(arrow_cstate->output->Flush());
 }
 
 const CopyToRoutine copy_to_routine_arrow = {
